@@ -1,0 +1,7 @@
+__pycache__
+user_data/*
+!user_data/default
+test.ipynb
+test.json
+test.txt
+dustbin
