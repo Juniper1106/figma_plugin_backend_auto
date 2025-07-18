@@ -1,4 +1,5 @@
 # app/routes.py
+from anyio import current_time
 from app import app
 from flask import request, jsonify, send_from_directory
 import asyncio
@@ -23,6 +24,7 @@ inactive_change = False
 inactive_update = False
 history_scale = 0.3
 DISC_follow_up = False # indicate whether a follow-up chat should be sent
+user_last_style = 'DISC'
 
 # 获取 routes.py 文件所在目录的上一级目录
 current_directory = os.path.dirname(os.path.abspath(__file__))
@@ -48,9 +50,15 @@ max_msg_id = 0
     
 background_task_thread1 = None
 background_task_thread2 = None
+coupling_style_judgement_thread3 = None
+
 # 全局事件对象，用于停止后台任务
 stop_event_task1 = threading.Event()
 stop_event_task2 = threading.Event()
+# 后台不断判断各种cue
+stop_coupling_style_judgement = threading.Event()
+
+style_change_lock = threading.Lock()
 
 @app.route('/')
 def home():
@@ -204,7 +212,6 @@ def create_directory():
         config.style = 'DISC'
         # initial interval
         config.trigger_proactive_DISC_interval = 15
-        # config.trigger_proactive_OSTB_interval = 15
         config.trigger_proactive_SCOL_interval = 30
         config.trigger_proactive_INDW_interval = 45
 
@@ -270,65 +277,34 @@ def getMsgId():
 
 @app.route('/style_change', methods=['POST'])
 def styleChange():
-    handle_stop_background_task()
-    data = request.get_json()
-    config.style = data.get('style', '')
-    print(f"Style change to: {config.style}")
-    file_path = os.path.join(work_path, 'mode.json')
-    with open(file_path, 'w') as file:
-        json.dump(config.style, file)
-    utils.save_style(config.style, int(time.time() * 1000), work_path)
-    init_style_vars()
-    handle_start_background_task()
-    if config.style == 'DISC':
-        proactive_interval = config.trigger_proactive_DISC_interval
-    # elif config.style == 'OSTB':
-    #     proactive_interval = config.trigger_proactive_OSTB_interval
-    elif config.style == 'SCOL':
-        proactive_interval = config.trigger_proactive_SCOL_interval
-    else:
-        proactive_interval = config.trigger_proactive_INDW_interval
-    print(f"proactive_interval: {proactive_interval}")
-    return jsonify({
-        "message": f"Style change to: {config.style}",
-        "proactive_interval": proactive_interval
-    }), 200
-
-# 弃用
-# @app.route('/interval_change', methods=['POST'])
-# def intervalChange():
-#     handle_stop_background_task()
-#     data = request.get_json()
-#     if config.style == 'DISC':
-#         config.trigger_proactive_DISC_interval = data.get('interval', 15)
-#         message = f"Interval change to: {config.trigger_proactive_DISC_interval}"
-#     elif config.style == 'OSTB':
-#         config.trigger_proactive_OSTB_interval = data.get('interval', 15)
-#         message = f"Interval change to: {config.trigger_proactive_OSTB_interval}"
-#     elif config.style == 'SCOL':
-#         config.trigger_proactive_SCOL_interval = data.get('interval', 30)
-#         message = f"Interval change to: {config.trigger_proactive_SCOL_interval}"
-#     else:
-#         config.trigger_proactive_INDW_interval = data.get('interval', 45)
-#         message = f"Interval change to: {config.trigger_proactive_INDW_interval}"
-#     print(message)
-#     init_style_vars()
-#     handle_start_background_task()
-#     return jsonify({"message": message}), 200
-
-# 弃用
-# @app.route('/context_change', methods=['POST'])
-# def contextChange():
-#     data = request.get_json()
-#     config.context_range = data.get('context', 1)
-#     message = f"Context range change to: {config.context_range}"
-#     print(message)
-#     return jsonify({"message": message}), 200
-
-# # 弃用
-# @app.route('/get_OSTB_interval', methods=['GET'])
-# def getOSTBInterval():
-#     return jsonify({"interval": config.trigger_proactive_OSTB_interval}), 200
+    if not style_change_lock.acquire(blocking=False):
+        print("style_change 正在执行中，跳过此次请求")
+        return jsonify({"message": "存在未完成的Style change请求"}), 429
+    
+    try:
+        handle_stop_background_task()
+        data = request.get_json()
+        config.style = data.get('style', '')
+        print(f"Style change to: {config.style}")
+        file_path = os.path.join(work_path, 'mode.json')
+        with open(file_path, 'w') as file:
+            json.dump(config.style, file)
+        utils.save_style(config.style, int(time.time() * 1000), work_path)
+        init_style_vars()
+        handle_start_background_task()
+        if config.style == 'DISC':
+            proactive_interval = config.trigger_proactive_DISC_interval
+        elif config.style == 'SCOL':
+            proactive_interval = config.trigger_proactive_SCOL_interval
+        else:
+            proactive_interval = config.trigger_proactive_INDW_interval
+        print(f"proactive_interval: {proactive_interval}")
+        return jsonify({
+            "message": f"Style change to: {config.style}",
+            "proactive_interval": proactive_interval
+        }), 200
+    finally:
+        style_change_lock.release()
 
 # （弃用）15秒内无操作，主动交流
 @app.route('/inactive_change', methods=['GET'])
@@ -409,6 +385,24 @@ def refresh():
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}
 
+def proactive_conclude():
+    global count, max_msg_id
+    while not stop_event_task1.is_set():
+        if config.style == 'DISC':
+            while count < 2 and not stop_event_task1.is_set():
+                time.sleep(1)
+            if stop_event_task1.is_set():
+                print("proactive_conclude stopped.")
+                return
+            socketio.emit('edit_canvas')
+            conclude = asyncio.run(gpt.conclude(work_path, socketio))
+            if stop_event_task1.is_set():
+                print("proactive_conclude stopped.")
+                return
+            socketio.emit('AI_conclude', {'id': conclude['action_id'], 'text': conclude['text'], 'img_url': ''})
+            count = 0
+    print("proactive_conclude stopped.")
+
 def proactive_chat():
     global last_active_time, pre_proactive_response,inactive_change, inactive_update, DISC_follow_up
     while not stop_event_task2.is_set():
@@ -447,14 +441,6 @@ def proactive_chat():
                     return
                 socketio.emit('AI_message', {'id': id, 'text': res['text'], 'img_url': res['image']})
                 last_active_time = time.time()
-        # elif config.style == 'OSTB':
-        #     if inactive_change and inactive_update:
-        #         print('OSTB状态下，用户15秒无有效，AI发起主动交流')
-        #         time_stamp = int(time.time() * 1000)
-        #         res = asyncio.run(gpt.chat(work_path, id, '', time_stamp, socketio, True))
-        #         socketio.emit('AI_message', {'id': id, 'text': res['text'], 'img_url': res['image']})
-        #         inactive_change = False
-        #         inactive_update = False
         elif config.style == 'SCOL':
             while not stop_event_task2.is_set() and time.time() - last_active_time < config.trigger_proactive_SCOL_interval:
                 time.sleep(1)
@@ -484,11 +470,35 @@ def proactive_chat():
             socketio.emit('AI_message', {'id': id, 'text': res['text'], 'img_url': res['image']})
             last_active_time = time.time()
     print("proactive_chat stopped.")
+
+def coupling_style_judgement():
+    global user_last_style
+    print(f"启动 coupling_style_judgement 线程，ID = {threading.get_ident()}")
+    while not stop_coupling_style_judgement.is_set():
+        # style_options = ['DISC', 'OSTB', 'SCOL', 'INDW']
+        if stop_coupling_style_judgement.is_set():
+            print("style judgement is stopped")
+            return
+        style_options = ['DISC', 'SCOL', 'INDW']
+
+        interrupted = stop_coupling_style_judgement.wait(timeout=10)
+        if interrupted:
+            print("style judgement is stopped (interrupted during wait)")
+            break  # 跳出 while，线程结束
+        
+        next_AI_style = random.choice(style_options)
+        while next_AI_style == user_last_style:
+            next_AI_style = random.choice(style_options)
+        user_last_style = next_AI_style
+        print(f'用户当前的coupling style是：{next_AI_style}')
+        
+        socketio.emit('change_AI_style', next_AI_style)
+    
         
 # 启动后台任务事件
 @socketio.on('start_background_task')
 def handle_start_background_task():
-    global background_task_thread1, background_task_thread2, stop_event_task1, stop_event_task2
+    global background_task_thread1, background_task_thread2, stop_event_task1, stop_event_task2, coupling_style_judgement_thread3, stop_coupling_style_judgement
 
     # 如果任务1未启动或已停止，则启动
     if background_task_thread1 is None or not background_task_thread1.is_alive():
@@ -501,16 +511,21 @@ def handle_start_background_task():
         stop_event_task2.clear()  # 确保停止事件被清除
         background_task_thread2 = socketio.start_background_task(proactive_chat)
         print("start background task2")
+        
+    if coupling_style_judgement_thread3 is None or not coupling_style_judgement_thread3.is_alive():
+        stop_coupling_style_judgement.clear()
+        coupling_style_judgement_thread3 = socketio.start_background_task(coupling_style_judgement)
+        print("start transitioning cue judgement")
 
 # 停止后台任务事件
 @socketio.on('stop_background_task')
 def handle_stop_background_task():
-    global background_task_thread1, background_task_thread2, stop_event_task1, stop_event_task2
+    global background_task_thread1, background_task_thread2, stop_event_task1, stop_event_task2, coupling_style_judgement_thread3, stop_coupling_style_judgement
 
     # 停止任务1
     if background_task_thread1 and background_task_thread1.is_alive():
-        stop_event_task1.set()  # 通知任务1停止
-        background_task_thread1.join()  # 等待任务1停止
+        stop_event_task1.set()  
+        background_task_thread1.join()  
         background_task_thread1 = None
         print("stop background task1")
 
@@ -521,23 +536,12 @@ def handle_stop_background_task():
         background_task_thread2 = None
         print("stop background task2")
 
-def proactive_conclude():
-    global count, max_msg_id
-    while not stop_event_task1.is_set():
-        if config.style == 'DISC':
-            while count < 2 and not stop_event_task1.is_set():
-                time.sleep(1)
-            if stop_event_task1.is_set():
-                print("proactive_conclude stopped.")
-                return
-            socketio.emit('edit_canvas')
-            conclude = asyncio.run(gpt.conclude(work_path, socketio))
-            if stop_event_task1.is_set():
-                print("proactive_conclude stopped.")
-                return
-            socketio.emit('AI_conclude', {'id': conclude['action_id'], 'text': conclude['text'], 'img_url': ''})
-            count = 0
-    print("proactive_conclude stopped.")
+    # stop style judgement
+    if coupling_style_judgement_thread3 and coupling_style_judgement_thread3.is_alive():
+        stop_coupling_style_judgement.set()  # 通知任务2停止
+        coupling_style_judgement_thread3.join()  # 等待任务2停止
+        coupling_style_judgement_thread3 = None
+        print("stop transitioning cue judgement")
 
 def init_style_vars():
     global count, last_active_time, pre_proactive_response, inactive_change, inactive_update, DISC_follow_up
@@ -546,17 +550,3 @@ def init_style_vars():
     pre_proactive_response = None
     inactive_change = False
     inactive_update = False
-    # DISC_follow_up = False
-    # if config.style == 'DISC':
-    #     count = 0
-    #     last_active_time = None
-    #     pre_proactive_response = None
-    #     inactive_change = False
-    #     inactive_update = False
-    #     DISC_follow_up = False
-    # else:
-    #     count = 0
-    #     last_active_time = time.time()
-    #     pre_proactive_response = None
-    #     inactive_change = False
-    #     inactive_update = False
